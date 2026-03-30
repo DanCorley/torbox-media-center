@@ -32,6 +32,9 @@ def process_file(item, file, type):
     if not file.get("mimetype").startswith("video/") or file.get("mimetype") not in ACCEPTABLE_MIME_TYPES:
         logging.debug(f"Skipping file {file.get('short_name')} with mimetype {file.get('mimetype')}")
         return None
+    elif "sample." in file.get('name').lower():
+        logging.debug(f"Skipping file {file.get('short_name')} - it looks like a sample.")
+        return None
     
     data = {
         "item_id": item.get("id"),
