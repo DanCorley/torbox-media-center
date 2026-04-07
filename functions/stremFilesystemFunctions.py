@@ -1,7 +1,7 @@
 import os
 import glob
 import logging
-from library.app import RAW_MODE
+from library.app import RAW_MODE, ENABLE_TAG_FOLDERS
 from library.filesystem import MOUNT_PATH
 from functions.appFunctions import getAllUserDownloads
 
@@ -22,26 +22,16 @@ def generateFolderPath(data: dict) -> str | None:
       if not root_folder:
           return None
 
-      if data.get("metadata_mediatype") == "series":
+      if data.get("metadata_mediatype") in ("series", "anime"):
           if not metadata_foldername:
               return None
           folder_path = os.path.join(
               root_folder,
-              metadata_foldername,
+              metadata_foldername
           )
-      elif data.get("metadata_mediatype") == "movie":
-          folder_path = os.path.join(
-              root_folder
-          )
+      else:
+          folder_path = root_folder
 
-      elif data.get("metadata_mediatype") == "anime":
-          if not metadata_foldername:
-              return None
-          folder_path = os.path.join(
-              root_folder,
-              metadata_foldername,
-          )
-          
       return folder_path
 
 def generateStremFile(file_path: str, url: str, type: str, file_name: str, download=None):
@@ -50,13 +40,16 @@ def generateStremFile(file_path: str, url: str, type: str, file_name: str, downl
         if original_path:
             full_path = os.path.join(MOUNT_PATH, os.path.dirname(original_path))
     else:
-        if type == "movie":
-            type = "movies"
-        elif type == "series":
-            type = "series"
-        elif type == "anime":
-            type = "series"
-        full_path = os.path.join(MOUNT_PATH, type, file_path)
+        tag_folder = download.get("metadata_tag_folder") if (ENABLE_TAG_FOLDERS and download) else None
+        if tag_folder:
+            folder_type = tag_folder
+        elif type == "movie":
+            folder_type = "movies"
+        elif type in ("series", "anime"):
+            folder_type = "series"
+        else:
+            folder_type = type
+        full_path = os.path.join(MOUNT_PATH, folder_type, file_path)
     try:
         os.makedirs(full_path, exist_ok=True)
         with open(f"{full_path}/{file_name}.strm", "w") as file:
@@ -86,14 +79,17 @@ def runStrm():
         if RAW_MODE:
             strm_path = os.path.join(MOUNT_PATH, file_path, f"{download.get('metadata_filename')}.strm")
         else:
-            type = download.get("metadata_mediatype")
-            if type == "movie":
-                type = "movies"
-            elif type == "series":
-                type = "series"
-            elif type == "anime":
-                type = "series"
-            strm_path = os.path.join(MOUNT_PATH, type, file_path, f"{download.get('metadata_filename')}.strm")
+            media_type = download.get("metadata_mediatype")
+            tag_folder = download.get("metadata_tag_folder") if ENABLE_TAG_FOLDERS else None
+            if tag_folder:
+                type_folder = tag_folder
+            elif media_type == "movie":
+                type_folder = "movies"
+            elif media_type in ("series", "anime"):
+                type_folder = "series"
+            else:
+                type_folder = media_type
+            strm_path = os.path.join(MOUNT_PATH, type_folder, file_path, f"{download.get('metadata_filename')}.strm")
         new_strm_files.add(strm_path)
         generateStremFile(file_path, download.get("download_link"), download.get("metadata_mediatype"), download.get("metadata_filename"), download)
 

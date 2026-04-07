@@ -6,6 +6,7 @@ load_dotenv()
 
 SCAN_METADATA = os.getenv("ENABLE_METADATA", "false").lower() == "true"
 RAW_MODE = os.getenv("RAW_MODE", "false").lower() == "true"
+ENABLE_TAG_FOLDERS = os.getenv("ENABLE_TAG_FOLDERS", "false").lower() == "true"
 
 class MountRefreshTimes(Enum):
     # times are shown in hours

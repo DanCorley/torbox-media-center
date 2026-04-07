@@ -1,4 +1,4 @@
-from library.app import RAW_MODE
+from library.app import RAW_MODE, ENABLE_TAG_FOLDERS
 import os
 from library.filesystem import MOUNT_PATH
 import stat
@@ -50,37 +50,41 @@ class VirtualFileSystem:
                 structure[key] = sorted([item for item in structure[key] if item is not None])
             return structure
         else:
+            root_entries = ['movies', 'series']
             structure = {
-                '/': ['movies', 'series'],
+                '/': root_entries,
                 '/movies': set(),
                 '/series': set()
             }
-        
-        
+
         for f in self.files:
             media_type = f.get('metadata_mediatype')
             root_folder = f.get('metadata_rootfoldername')
-            
-            if media_type == 'movie':
-                path = f'/movies/{root_folder}'
-                structure['/movies'].add(root_folder)
-                
-                if path not in structure:
-                    structure[path] = set()
-                structure[path].add(f.get('metadata_filename'))
-                
-            elif media_type == 'series':
-                path = f'/series/{root_folder}'
-                structure['/series'].add(root_folder)
-                
-                if path not in structure:
-                    structure[path] = set()
+            tag_folder = f.get('metadata_tag_folder') if ENABLE_TAG_FOLDERS else None
+
+            if tag_folder:
+                top = tag_folder
+                if f'/{top}' not in structure:
+                    root_entries.append(top)
+                    structure[f'/{top}'] = set()
+            elif media_type == 'movie':
+                top = 'movies'
+            else:
+                top = 'series'
+
+            structure[f'/{top}'].add(root_folder)
+            path = f'/{top}/{root_folder}'
+            if path not in structure:
+                structure[path] = set()
+
+            if media_type in ('series', 'anime') and f.get('metadata_foldername'):
                 structure[path].add(f.get('metadata_foldername'))
-                
                 season_path = f'{path}/{f.get("metadata_foldername")}'
                 if season_path not in structure:
                     structure[season_path] = set()
                 structure[season_path].add(f.get('metadata_filename'))
+            else:
+                structure[path].add(f.get('metadata_filename'))
         
         # consistent ordering
         for key in structure:
@@ -97,12 +101,16 @@ class VirtualFileSystem:
                     path = f'/{original_path}'
                     file_map[path] = f
             else:
-                if f.get('metadata_mediatype') == 'movie':
-                    path = f'/movies/{f.get("metadata_rootfoldername")}/{f.get("metadata_filename")}'
-                    file_map[path] = f
-                else:  # series
-                    path = f'/series/{f.get("metadata_rootfoldername")}/{f.get("metadata_foldername")}/{f.get("metadata_filename")}'
-                    file_map[path] = f
+                media_type = f.get('metadata_mediatype')
+                tag_folder = f.get('metadata_tag_folder') if ENABLE_TAG_FOLDERS else None
+                top = tag_folder if tag_folder else ('movies' if media_type == 'movie' else 'series')
+                root_folder = f.get('metadata_rootfoldername')
+
+                if media_type in ('series', 'anime') and f.get('metadata_foldername'):
+                    path = f'/{top}/{root_folder}/{f.get("metadata_foldername")}/{f.get("metadata_filename")}'
+                else:
+                    path = f'/{top}/{root_folder}/{f.get("metadata_filename")}'
+                file_map[path] = f
 
         return file_map
 

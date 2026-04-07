@@ -3,7 +3,7 @@ import httpx
 from enum import Enum
 import PTN
 from library.torbox import TORBOX_API_KEY
-from library.app import SCAN_METADATA
+from library.app import SCAN_METADATA, ENABLE_TAG_FOLDERS
 from functions.mediaFunctions import constructSeriesTitle, cleanTitle, cleanYear
 from functions.databaseFunctions import insertData
 import os
@@ -54,7 +54,7 @@ def process_file(item, file, type):
     if item.get("name") == item.get("hash"):
         item["name"] = title_data.get("title", file.get("short_name"))
 
-    metadata, _, _ = searchMetadata(title_data.get("title", file.get("short_name")), title_data, file.get("short_name"), f"{item.get('name')} {file.get('short_name')}", item.get("hash"), item.get("name"))
+    metadata, _, _ = searchMetadata(title_data.get("title", file.get("short_name")), title_data, file.get("short_name"), f"{item.get('name')} {file.get('short_name')}", item.get("hash"), item.get("name"), item.get("tags", []))
     data.update(metadata)
     logging.debug(data)
     insertData(data, type.value)
@@ -132,7 +132,14 @@ def getUserDownloads(type: DownloadType):
             
     return files, True, f"{type.value.capitalize()} fetched successfully."
 
-def searchMetadata(query: str, title_data: dict, file_name: str, full_title: str, hash: str, item_name: str):
+def searchMetadata(query: str, title_data: dict, file_name: str, full_title: str, hash: str, item_name: str, tags: list = []):
+    metadata_tag_folder = None
+    if ENABLE_TAG_FOLDERS and tags:
+        for tag in tags:
+            if isinstance(tag, str) and tag.startswith("folder="):
+                metadata_tag_folder = tag.split("=", 1)[1].strip() or None
+                break
+
     base_metadata = {
         "metadata_title": cleanTitle(query),
         "metadata_link": None,
@@ -144,6 +151,7 @@ def searchMetadata(query: str, title_data: dict, file_name: str, full_title: str
         "metadata_episode": None,
         "metadata_filename": file_name,
         "metadata_rootfoldername": title_data.get("item_name", None),
+        "metadata_tag_folder": metadata_tag_folder,
     }
     if not SCAN_METADATA:
         base_metadata["metadata_rootfoldername"] = item_name
