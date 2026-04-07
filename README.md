@@ -30,7 +30,7 @@ The TorBox Media Center allows you to easily mount your TorBox media in a no-fri
 
 ### ✖️ What this application does not do
 
-- Folder customization *(limited to 'movies' and 'series')*
+- Unlimited folder customization *(beyond tag-based folders)*
 - Provides WebDAV server *(use TorBox's WebDAV)*
 - Works with all types of files *(limited to video files)*
 - Gets you banned from TorBox *(developed by TorBox team)*
@@ -95,6 +95,8 @@ To run this project you will need to add the following environment variables to 
 `ENABLE_METADATA` This option allows you to enable scanning the metadata of your files. If this is enabled, TorBox will __attempt__ to find the correct metadata for your files in your TorBox account. This isn't perfect, so use with caution. If this option is `false` it skips scanning and places all of your video files in the `movies` folder. If it is enabled, TorBox will scan, and attempt to place your files into either the `movies` or `series` folders. Please also keep in mind that you will be subject to rate limiting of our search endpoint when using the metadata option. Seeing 429 errors will be common. Most of the time it is best to keep this option disabled unless you video player absolutely requires it. Also keep in mind, this unlocks the `instant` option, which can allow you to refresh every 6 minutes.
 
 `RAW_MODE` This option determines whether you want the raw file structure (similar to what you would see with webdav). Setting this to `true` will present the files in the original structure. If this is enabled, the `ENABLE_METADATA` option is disabled.
+
+`ENABLE_TAG_FOLDERS` This option allows you to organize your media into custom top-level folders based on tags you set in the TorBox dashboard. When enabled, any torrent tagged with `folder=<name>` (e.g. `folder=anime`, `folder=sports`, `folder=adult`) will appear under `/<name>/` in your mount path instead of the default `movies` or `series` folders. Items without a `folder` tag fall back to the standard `movies`/`series` organization. This is useful for bypassing automated metadata classification — for example, routing long-form anime that would otherwise be classified as movies into a dedicated `/anime/` folder. The default is `false` and is optional.
 
 ## 🐳 Running on Docker with one command (recommended)
 
@@ -227,7 +229,7 @@ This ensures that Plex/Jellyfin/Emby can see the TorBox Media Center files on th
 -v /home/wamy/torbox:/torbox-media-center
 ```
 
-Then inside your Plex/Jellyfin/Emby container, set the library location to /torbox-media-center/movies for movies, and /torbox-media-center/series for TV shows.
+Then inside your Plex/Jellyfin/Emby container, set the library location to `/torbox-media-center/movies` for movies, and `/torbox-media-center/series` for TV shows. If you are using `ENABLE_TAG_FOLDERS`, add a library for each custom folder (e.g. `/torbox-media-center/anime`).
 
 
 ### I cannot modify the files inside of the Fuse path! ###
