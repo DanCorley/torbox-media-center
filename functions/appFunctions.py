@@ -3,6 +3,7 @@ from functions.torboxFunctions import getUserDownloads, DownloadType
 from library.filesystem import MOUNT_METHOD, MOUNT_PATH
 from library.app import MOUNT_REFRESH_TIME
 from library.torbox import TORBOX_API_KEY
+from library.overrides import load_overrides
 from functions.databaseFunctions import getAllData, clearDatabase
 import logging
 import os
@@ -77,6 +78,7 @@ def bootUp():
     if latest_version != current_version:
         logging.warning(f"!!! A new version of TorBox Media Center is available: {latest_version}. You are running version: {current_version}. Please consider updating to the latest version. !!!")
 
+    load_overrides()
     initializeFolders()
 
     return True

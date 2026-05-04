@@ -4,6 +4,7 @@ from enum import Enum
 import PTN
 from library.torbox import TORBOX_API_KEY
 from library.app import SCAN_METADATA
+from library.overrides import get_override
 from functions.mediaFunctions import constructSeriesTitle, cleanTitle, cleanYear
 from functions.databaseFunctions import insertData
 import os
@@ -25,6 +26,7 @@ class IDType(Enum):
 ACCEPTABLE_MIME_TYPES = [
     "video/x-matroska",
     "video/mp4",
+    "video/x-msvideo",
 ]
 
 def process_file(item, file, type):
@@ -149,6 +151,8 @@ def searchMetadata(query: str, title_data: dict, file_name: str, full_title: str
         base_metadata["metadata_rootfoldername"] = item_name
         return base_metadata, False, "Metadata scanning is disabled."
     extension = os.path.splitext(file_name)[-1]
+    # override = get_override(hash, item_name)
+    # search_term = override.get("search_query", full_title) if override else full_title
     try:
         response = requestWrapper(search_api_http_client, "GET", f"/meta/search/{full_title}", params={"type": "file"})
     except Exception as e:
