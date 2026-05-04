@@ -26,7 +26,6 @@ class IDType(Enum):
 ACCEPTABLE_MIME_TYPES = [
     "video/x-matroska",
     "video/mp4",
-    "video/x-msvideo",
 ]
 
 def process_file(item, file, type):
