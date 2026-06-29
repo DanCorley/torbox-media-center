@@ -29,10 +29,12 @@ ACCEPTABLE_MIME_TYPES = [
 
 def process_file(item, file, type):
     """Process a single file and return the processed data"""
+    title_data = PTN.parse(file.get("short_name"))
+
     if not file.get("mimetype").startswith("video/") or file.get("mimetype") not in ACCEPTABLE_MIME_TYPES:
         logging.debug(f"Skipping file {file.get('short_name')} with mimetype {file.get('mimetype')}")
         return None
-    elif "sample." in file.get('name').lower():
+    elif "sample." in file.get("name").lower() or title_data["title"].lower() == "sample" :
         logging.debug(f"Skipping file {file.get('short_name')} - it looks like a sample.")
         return None
     
@@ -53,7 +55,6 @@ def process_file(item, file, type):
         "extension": os.path.splitext(file.get("short_name"))[-1],
         "created_at": item.get("created_at"),
     }
-    title_data = PTN.parse(file.get("short_name"))
 
     if item.get("name") == item.get("hash"):
         item["name"] = title_data.get("title", file.get("short_name"))
