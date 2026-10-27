@@ -1,6 +1,7 @@
 from library.http import api_http_client, general_http_client, requestWrapper
 import httpx
 from enum import Enum
+import re
 import PTN
 from library.torbox import TORBOX_API_KEY
 from library.app import SCAN_METADATA
@@ -27,15 +28,78 @@ ACCEPTABLE_MIME_TYPES = [
     "video/mp4",
 ]
 
+# PTN keys that indicate a main-feature release file; extras parse to a bare title.
+RELEASE_TAG_KEYS = ("year", "resolution", "quality", "codec")
+
+# Keywords that mark a file as a secondary extra (interview, trailer, featurette...)
+# rather than the feature it ships with, e.g. "Interview - Greg McLean.mkv" or
+# "Theatrical Trailer.mkv". Both match patterns below are built from this list.
+EXTRA_KEYWORDS = (
+    "interviews?", "featurettes?", "making of", "commentar(?:y|ies)", "bloopers?",
+    "gag reels?", "deleted scenes?", "first look", "press conferences?",
+    "behind the scenes", "red carpet", "sneak peeks?", "b-roll",
+    "trailers?", "theatrical trailers?", "official trailers?",
+)
+# Extras that mimic release-style names still name themselves: either at the start
+# of the title ("Theatrical Trailer.1080p"), as a " - Cast"/" - Crew" suffix, or via
+# an episodeName ("Jungle.2017.Interview.Greg.McLean.1080p" -> episodeName "Interview Greg").
+EXTRA_TITLE_PATTERN = re.compile(
+    rf"^(?:{'|'.join(EXTRA_KEYWORDS)})|\s-\s(?:cast|crew)$",
+    re.IGNORECASE,
+)
+EXTRA_EPISODE_NAME_PATTERN = re.compile(
+    rf"\b(?:{'|'.join(EXTRA_KEYWORDS)})\b",
+    re.IGNORECASE,
+)
+
+def normalizeForMatch(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+def matchesItemTitle(title: str, item_name: str) -> bool:
+    """True when a bare file title still looks like the torrent's own name (e.g. specials)."""
+    file_norm = normalizeForMatch(title)
+    item_norm = normalizeForMatch(PTN.parse(item_name).get("title", ""))
+    if not file_norm or not item_norm:
+        return False
+    return file_norm.startswith(item_norm) or item_norm.startswith(file_norm)
+
+def isExtraFile(title_data: dict, item_name: str) -> bool:
+    """Detect secondary files (interviews, trailers, featurettes) using PTN-parsed data."""
+    # Episodes with sXXeXX numbering are content, never extras.
+    if title_data.get("season") is not None or title_data.get("episode") is not None:
+        return False
+
+    # The main feature carries release metadata; extras that mimic release-style
+    # names still announce themselves via episodeName or a keyword pattern.
+    if any(title_data.get(key) for key in RELEASE_TAG_KEYS):
+        return bool(
+            EXTRA_EPISODE_NAME_PATTERN.search(title_data.get("episodeName") or "")
+            or EXTRA_TITLE_PATTERN.search(title_data.get("title") or "")
+        )
+
+    # No release tags and no episode numbering: only keep it if the title
+    # still matches the torrent name (covers unnumbered specials), otherwise
+    # it's an extra like "Cinephile.mkv" or "Interview - Greg McLean.mkv".
+    return not matchesItemTitle(title_data.get("title") or "", item_name)
+
+def getSkipReason(item, file, title_data: dict) -> str | None:
+    """Return why a file should be skipped, or None if it is worth processing."""
+    mimetype = file.get("mimetype") or ""
+    if mimetype not in ACCEPTABLE_MIME_TYPES:
+        return f"unacceptable mimetype {mimetype}"
+    if "sample." in (file.get("name") or "").lower() or (title_data.get("title") or "").lower() == "sample":
+        return "it looks like a sample"
+    if isExtraFile(title_data, item.get("name", "")):
+        return "it looks like an extra (interview/trailer/featurette)"
+    return None
+
 def process_file(item, file, type):
     """Process a single file and return the processed data"""
     title_data = PTN.parse(file.get("short_name"))
 
-    if not file.get("mimetype").startswith("video/") or file.get("mimetype") not in ACCEPTABLE_MIME_TYPES:
-        logging.debug(f"Skipping file {file.get('short_name')} with mimetype {file.get('mimetype')}")
-        return None
-    elif "sample." in file.get("name").lower() or title_data["title"].lower() == "sample" :
-        logging.debug(f"Skipping file {file.get('short_name')} - it looks like a sample.")
+    skip_reason = getSkipReason(item, file, title_data)
+    if skip_reason:
+        logging.debug(f"Skipping file {file.get('short_name')} - {skip_reason}")
         return None
     
     data = {
