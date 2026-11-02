@@ -70,14 +70,16 @@ both speak the control API. The authoritative matrix lives in
 [docker.md](docker.md#compatibility-matrix); keep it updated when either side is
 released.
 
-| TMC version | Control API version | Jellyfin plugin | Jellyfin |
-|---|---|---|---|
-| 2.0.x | not reported yet | 0.1.x | 10.11.x |
-| _next_ | _1_ | _x.y.z_ | _10.11.x_ |
+| TMC version | Control API version | Jellyfin plugin | Jellyfin | Notes |
+|---|---|---|---|---|
+| 2.0.x | not reported | 0.1.x | 10.11.x | Legacy synchronous `POST /refresh` only. |
+| next 2.x (`feat/jellyfin-refresh-control-api`) | **2** | **1.1.0** | **12.4.0** | `/health` reports `api_version: 2`; async jobs plus idempotency keys. Synchronous `POST /refresh` is retained for plugin 1.0.0. |
+| _next_ | _2_ | _1.1.x_ | _13.x_ | **Pending.** Jellyfin 13.x NuGet packages (`Jellyfin.Controller` / `Jellyfin.Model`) are not published yet, so no 13.x plugin artifact exists. |
 
 The plugin is optional. Without it, TMC keeps refreshing on
 `MOUNT_REFRESH_TIME` as before. See
-[Compatibility matrix](docker.md#compatibility-matrix) for the full template and
+[Control API contract (v2)](#-control-api-contract-v2),
+[Compatibility matrix](docker.md#compatibility-matrix) and
 [Release, upgrade and rollback](docker.md#release-upgrade-and-rollback) before
 upgrading a production pair.
 
@@ -124,6 +126,91 @@ To run this project you will need to add the following environment variables to 
 
 The optional [Jellyfin plugin](https://github.com/DanCorley/jellyfin-plugin-torbox-refresh) calls the control API after a library scan and queues a follow-up scan when the mount changed. Configure its URL, token and cooldown in **Dashboard -> Plugins -> TorBox Refresh**.
 
+### 🔌 Control API contract (v2)
+
+All endpoints require `Authorization: Bearer <CONTROL_TOKEN>`. Requests without a
+matching token return `401`. Set `CONTROL_ENABLED=true` and a `CONTROL_TOKEN` to
+start the server; it listens on `CONTROL_HOST`:`CONTROL_PORT` (default
+`127.0.0.1:8787`, use `0.0.0.0` inside Docker).
+
+| Method and path | Purpose | Success |
+|---|---|---|
+| `GET /health` | Liveness, reported API version and last refresh state. | `200` |
+| `POST /refresh` | Synchronous refresh, kept for plugin **1.0.0** compatibility. | `200` |
+| `POST /refresh/jobs` | Start an async refresh job. | `202` |
+| `GET /refresh/jobs/{id}` | Poll an async job. | `200` |
+
+`GET /health` returns:
+
+```json
+{
+  "status": "ok",
+  "api_version": 2,
+  "version": "<TMC version>",
+  "mode": "strm",
+  "last_finished": 1762070400.0,
+  "last_result": null,
+  "last_error": null
+}
+```
+
+`last_finished`, job `started_at` and job `finished_at` are Unix epoch seconds.
+`last_result` has the same shape as a completed refresh result: `refreshed`,
+`added`, `removed`, `updated`, `changed`, `partial`, `errors`, `mode` and
+`duration_ms`.
+
+`POST /refresh` (synchronous) runs the refresh in the request and returns the
+refresh result with `200`. It is **not** removed: plugin 1.0.0 still calls it.
+New clients should use the job endpoints.
+
+`POST /refresh/jobs` returns `202` immediately:
+
+```json
+{
+  "job_id": "<32 hex characters>",
+  "status": "queued",
+  "status_url": "/refresh/jobs/<job_id>"
+}
+```
+
+`GET /refresh/jobs/{id}` returns the job:
+
+```json
+{
+  "job_id": "<id>",
+  "status": "completed",
+  "started_at": 1762070400.0,
+  "finished_at": 1762070430.0,
+  "result": { "added": 3, "removed": 0, "updated": 1, "changed": 4, "partial": false, "mode": "strm", "duration_ms": 30000 },
+  "error": null
+}
+```
+
+`status` is `queued`, `running`, `completed` or `failed`. A failed job sets
+`error` and leaves `result` null. Only one refresh runs at a time; the server
+retains the **last 20 finished jobs** and returns `404` for anything older.
+
+Idempotency: send an `Idempotency-Key` header on `POST /refresh/jobs`. A repeat
+with the same key returns `202` for the existing job (including its current
+status) instead of starting another refresh. Keys are forgotten once their job
+is evicted. The synchronous endpoint does not implement idempotency.
+
+`{"force": true}` bypasses the `CONTROL_MIN_INTERVAL` cooldown for either
+endpoint, but not the single-refresh lock.
+
+Status codes:
+
+| Code | Meaning |
+|---|---|
+| `200` | Health read, sync refresh completed, or job read succeeded. |
+| `202` | Async job accepted, or an idempotent replay of an existing job. |
+| `400` | Request body is not valid JSON. |
+| `401` | Missing or wrong bearer token. |
+| `404` | Unknown path or an evicted/unknown `job_id`. |
+| `409` | A refresh is already running. Async responses include `job_id` and `active_job_id`; `force` does not bypass this. |
+| `429` | `CONTROL_MIN_INTERVAL` cooldown is active. The body has `error: "cooldown"` and `retry_after` (seconds); the `Retry-After` header is also set. |
+| `500` | Synchronous refresh raised an error. Async failures are reported on the job as `failed`. |
+
 ### 🔐 Control API security (read before enabling)
 
 The control API can trigger library refreshes, so treat it as an internal
@@ -147,9 +234,9 @@ service:
   `.strm` files embed the API key. This is an accepted design constraint of
   `strm` mode: restrict library permissions, never share the files, and revoke
   the key in TorBox if it leaks.
-- **Watch refresh health.** `/health` reports `last_finished`, `last_result`
-  and `last_error`; alert on `last_error` and slow `duration_ms`, not only on
-  container health. Logs are rotated by compose.
+- **Watch refresh health.** `/health` reports `api_version: 2`, `last_finished`,
+  `last_result` and `last_error`; alert on `last_error` and slow `duration_ms`,
+  not only on container health. Logs are rotated by compose.
 
 ```
 Jellyfin plugin --HTTP + Bearer--> TMC control API :8787 (private network)
@@ -311,6 +398,60 @@ Then inside your Plex/Jellyfin/Emby container, set the library location to /torb
 
 The Fuse mount is not meant to be editable, it is read-only. You cannot rename files, delete files, or move them around. This is by design as this software handles that. To delete a file, simply delete it from your TorBox account.
 
+### Control API and Jellyfin plugin ###
+
+**`401 unauthorized` from `/health`, `/refresh` or `/refresh/jobs`.** The
+plugin token and `CONTROL_TOKEN` differ, the token was changed without
+restarting TMC, or a reverse proxy stripped the `Authorization` header. TMC
+reads the token once at process start, so restart it after changing
+`CONTROL_TOKEN`. Open the plugin settings and re-enter the same value; never
+reuse `TORBOX_API_KEY`. See
+[token generation and rotation](docker.md#generating-and-rotating-the-control-token).
+
+**`409 refresh already running`.** A scheduled `MOUNT_REFRESH_TIME` refresh, a
+manual refresh, or a previous scan is still holding the refresh lock. Async
+responses include `job_id`/`active_job_id`; poll `GET /refresh/jobs/{id}`
+instead of retrying. `{"force": true}` bypasses the cooldown, not the lock. The
+plugin treats `409` as "already handled" and does not queue a follow-up scan.
+
+**`429 cooldown`.** `CONTROL_MIN_INTERVAL` has not elapsed since the last
+refresh finished. The response has `retry_after` and a `Retry-After` header.
+This is separate from the plugin's own cooldown; the effective minimum gap is
+the larger of the two. Set `CONTROL_MIN_INTERVAL` above a typical refresh
+duration. See [refresh timing](docker.md#refresh-timing-control_min_interval-and-the-plugin-cooldown).
+
+**Jellyfin warns about a side-loaded plugin or an untrusted repository.** Add
+the manifest URL under **Dashboard -> Plugins -> Repositories**, then install
+**TorBox Refresh** from the catalog. If you previously copied the DLL manually,
+remove the whole `TorBoxRefresh` folder from the Jellyfin plugins directory
+before installing; two copies with the same GUID cause load warnings. Restart
+Jellyfin after adding or removing a plugin. The catalog entry currently has no
+custom icon, so Jellyfin may show a placeholder.
+
+**Files do not appear after the first scan.** The expected sequence is two
+scans: the first scan finishes walking the mount and only then asks TMC to
+refresh, so its post-scan task queues a second scan when counts changed. The
+second scan sees the new files. The second scan's post-scan task is inside the
+plugin cooldown and stops, preventing a loop. Do not disable the follow-up scan
+unless something else watches the mount.
+
+**Where is the token stored?** TMC reads `CONTROL_TOKEN` from the environment or
+a secret file. The plugin stores its copy in Jellyfin's plugin configuration XML
+under the Jellyfin config directory, in plain text. Restrict that directory to
+the Jellyfin user, back it up securely, and rotate the control token if either
+copy leaks.
+
+**Refresh times out or takes minutes.** With metadata disabled a refresh is
+usually fast. With `ENABLE_METADATA=true` the TorBox search endpoint is rate
+limited and a refresh can take several minutes. Raise the plugin **Request
+timeout** to 300-600 seconds and the proxy read timeout to match. A timed-out
+request or job keeps running on TMC; the next attempt returns `409` or `429`,
+which the plugin treats as "in progress", not a hard failure. See
+[metadata-enabled slow refresh](docker.md#metadata-enabled-slow-refresh-and-plugin-timeout).
+
+For the full operational checklist, see
+[Control API troubleshooting](docker.md#troubleshooting-the-control-api-and-plugin).
+
 ## 🚀 Releases, upgrades and rollback
 
 TMC images are built by
@@ -324,8 +465,10 @@ Docker Hub account unless you explicitly enable it.
 - Upgrade order: **TMC first, then the Jellyfin plugin.** The control API is
   additive, so an older plugin keeps working against a newer TMC, but a newer
   plugin may require endpoints an older TMC does not have.
-- Verify after each step: `GET /health` returns 200 with the expected fields,
-  then a manual refresh returns 200 with sane counts (not 401/404).
+- Verify after each step: `GET /health` returns 200 with `api_version: 2` and
+  the expected fields, then run a manual refresh (`POST /refresh` returns 200,
+  or `POST /refresh/jobs` returns 202 and completes) with sane counts (not
+  401/404/409/429).
 - Rollback: pin the previous TMC tag/digest, recreate the container, and roll
   the plugin back to the version listed for that TMC release in the
   [compatibility matrix](docker.md#compatibility-matrix). TMC rebuilds its local

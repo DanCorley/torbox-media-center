@@ -122,7 +122,9 @@ untrusted clients can reach.
   | Jellyfin            |  HTTP +      | torbox-media-center            |
   | TorBox Refresh      |  Bearer      |   CONTROL_HOST=0.0.0.0          |
   | plugin              | -----------> |   CONTROL_PORT=8787 (expose)   |
-  |                     |              |   GET /health, POST /refresh   |
+  |                     |              |   GET /health                  |
+  |                     |              |   POST /refresh (sync, v1)     |
+  |                     |              |   POST /refresh/jobs (async)   |
   +----------+----------+              +----------------+---------------+
              |                                          |
              | reads .strm from the shared volume       | HTTPS + TORBOX_API_KEY
@@ -143,6 +145,96 @@ Rules:
   to the TorBox API and to the metadata search endpoint.
 - Run Jellyfin and TMC in the same compose project so the plugin can call
   `http://torbox-media-center:8787` by service name.
+
+## Control API contract (v2)
+
+`CONTROL_API_VERSION` is `2` and `GET /health` reports it as `api_version`.
+Every endpoint requires `Authorization: Bearer <CONTROL_TOKEN>`; a missing or
+wrong token returns `401`. The server only starts when `CONTROL_ENABLED=true`
+and `CONTROL_TOKEN` is non-empty.
+
+| Method and path | Behavior | Success |
+|---|---|---|
+| `GET /health` | Liveness plus `api_version`, TMC `version`, `mode`, `last_finished`, `last_result`, `last_error`. | `200` |
+| `POST /refresh` | Synchronous refresh. Returns the refresh result. Retained for plugin **1.0.0** compatibility. | `200` |
+| `POST /refresh/jobs` | Queues one async refresh job and returns a job handle. | `202` |
+| `GET /refresh/jobs/{id}` | Returns job status, timestamps, result or error. | `200` |
+
+Health response:
+
+```json
+{
+  "status": "ok",
+  "api_version": 2,
+  "version": "<TMC version>",
+  "mode": "strm",
+  "last_finished": 1762070400.0,
+  "last_result": null,
+  "last_error": null
+}
+```
+
+Async job creation:
+
+```json
+{
+  "job_id": "<32 hex characters>",
+  "status": "queued",
+  "status_url": "/refresh/jobs/<job_id>"
+}
+```
+
+Job status:
+
+```json
+{
+  "job_id": "<id>",
+  "status": "completed",
+  "started_at": 1762070400.0,
+  "finished_at": 1762070430.0,
+  "result": { "added": 3, "removed": 0, "updated": 1, "changed": 4, "partial": false, "mode": "strm", "duration_ms": 30000 },
+  "error": null
+}
+```
+
+- `status` is `queued`, `running`, `completed` or `failed`. A failed job sets
+  `error` and leaves `result` null.
+- Timestamps (`last_finished`, `started_at`, `finished_at`) are Unix epoch
+  seconds.
+- The refresh result contains `refreshed`, `added`, `removed`, `updated`,
+  `changed`, `partial`, `errors`, `mode` and `duration_ms`.
+- Only one refresh runs at a time (scheduled, sync or async). A concurrent
+  async request gets `409` with `job_id`/`active_job_id`; the synchronous
+  endpoint gets `409` when the lock is held, or `429` if the cooldown check
+  runs first.
+- `{"force": true}` skips the `CONTROL_MIN_INTERVAL` cooldown but not the
+  refresh lock.
+- The server retains the **last 20 finished jobs**. Older jobs are evicted and
+  `GET /refresh/jobs/{id}` returns `404`.
+
+Idempotency: send an `Idempotency-Key` header with `POST /refresh/jobs`. A
+repeated key returns `202` for the same job (with its current status) instead of
+starting a new refresh, including after the job completed. The mapping is
+removed when the job falls out of the 20-job window. The synchronous endpoint
+has no idempotency support.
+
+Status codes:
+
+| Code | Meaning |
+|---|---|
+| `200` | Health, synchronous refresh result, or job read. |
+| `202` | Async job accepted or idempotently replayed. |
+| `400` | Request body is not valid JSON. |
+| `401` | Missing or incorrect bearer token. |
+| `404` | Unknown path or unknown/evicted job ID. |
+| `409` | A refresh is already running. |
+| `429` | Cooldown active. Body: `{"error":"cooldown","retry_after":<seconds>}` plus `Retry-After`. |
+| `500` | Synchronous refresh failed. Async failures appear as `status: failed` on the job. |
+
+Compatibility: plugin 1.0.0 calls synchronous `POST /refresh`. Plugin 1.1.0
+probes `GET /health`, uses `POST /refresh/jobs` when `api_version >= 2`, and
+falls back to the synchronous endpoint when `/health` returns `404` or an
+unreadable payload. A `401` is never treated as a fallback.
 
 ## Generating and rotating the control token
 
@@ -183,6 +275,12 @@ TMC accepts exactly one token at a time, so expect a short window where the
 plugin is rejected. Rotate during a maintenance window, or rotate the plugin
 first and accept rejected refreshes until TMC restarts. Every rejected request
 returns `401` and is safe to retry.
+
+The plugin stores the token in Jellyfin's plugin configuration XML inside the
+Jellyfin config directory, in plain text. Restrict that directory to the
+Jellyfin user, exclude it from shared backups, and treat it as a secret. TMC
+keeps its copy in the environment or the Docker secret file; rotating one side
+without the other produces `401` until both match.
 
 ## Do not reuse the TorBox API key
 
@@ -300,11 +398,18 @@ curl -fsS -H "Authorization: Bearer $CONTROL_TOKEN" \
   http://127.0.0.1:8787/health
 ```
 
-`/health` returns `status`, `version`, `mode`, `last_finished`, `last_result`
-and `last_error`. Use `last_error` and `last_result.duration_ms` for
-monitoring. A refresh that fails leaves `last_error` set and the container
-healthy (the API is still up); alert on that field, not only on container
-health.
+`/health` returns `status`, `api_version` (`2`), `version`, `mode`,
+`last_finished`, `last_result` and `last_error`. Use `last_error` and
+`last_result.duration_ms` for monitoring. A refresh that fails leaves
+`last_error` set and the container healthy (the API is still up); alert on that
+field, not only on container health. To watch an in-flight async refresh, poll
+`GET /refresh/jobs/{id}` and alert when `status` stays `running` beyond the
+expected duration or becomes `failed`.
+
+The health payload is also the plugin's API-version probe: the plugin only uses
+async jobs when `api_version >= 2`. Keep `GET /health` reachable and free of
+proxy caching, and do not change its schema without bumping
+`CONTROL_API_VERSION`.
 
 Log rotation is configured for the TMC service in `docker-compose.yaml`
 (`json-file`, `max-size: 10mb`, `max-file: 5`). Tune these for your retention
@@ -327,19 +432,21 @@ There are two independent throttles:
 
 | Layer | Setting | Behavior |
 |---|---|---|
-| Plugin (client) | cooldown in the plugin settings | Decides whether to call `/refresh` after a scan; usually 60-300s. |
-| TMC (server) | `CONTROL_MIN_INTERVAL` (default `60`) | Rejects `/refresh` with `429` and a `retry_after` value if the previous refresh finished less than this many seconds ago. |
+| Plugin (client) | cooldown in the plugin settings (default `300`) | Decides whether to call TMC after a scan; skips the call entirely while cooling down. |
+| TMC (server) | `CONTROL_MIN_INTERVAL` (default `60`) | Rejects `POST /refresh` or `POST /refresh/jobs` with `429`, a `retry_after` value and a `Retry-After` header if the previous refresh finished less than this many seconds ago. |
 
 The effective minimum gap between refreshes is therefore the larger of the two,
 and a plugin cooldown shorter than `CONTROL_MIN_INTERVAL` produces `429`s that
-the plugin must handle. Recommended: leave the plugin cooldown at or above
+the plugin treats as a no-op. Recommended: leave the plugin cooldown at or above
 `CONTROL_MIN_INTERVAL`, and set `CONTROL_MIN_INTERVAL` longer than a typical
 refresh (for example 300 with metadata disabled).
 
-`POST /refresh` with `{"force": true}` bypasses the interval check but not the
-refresh lock: a concurrent refresh returns `409 refresh already running`.
-`CONTROL_MIN_INTERVAL` does not affect the scheduled `MOUNT_REFRESH_TIME`
-refresh; it only gates control-API requests.
+`{"force": true}` bypasses the interval check but not the refresh lock: a
+concurrent request returns `409` with the active `job_id` (async) or
+`{"error":"refresh already running"}` (sync). Repeated scan triggers can also
+send an `Idempotency-Key` to `POST /refresh/jobs`; a replay returns `202` for the
+existing job instead of a second `409`. `CONTROL_MIN_INTERVAL` does not affect
+the scheduled `MOUNT_REFRESH_TIME` refresh; it only gates control-API requests.
 
 ## Metadata-enabled slow refresh and plugin timeout
 
@@ -349,14 +456,17 @@ can take minutes, which is much longer than a default plugin HTTP timeout.
 
 - Prefer `ENABLE_METADATA=false` unless the player requires `movies/series`
   separation; `strm` output is much faster and does not hit the rate limit.
-- If metadata is required, raise the plugin request timeout (for example to
-  300-600 seconds) and set the proxy/read timeout at least as high.
+- If metadata is required, raise the plugin **Request timeout** (for example to
+  300-600 seconds) and set the proxy/read timeout at least as high. With async
+  jobs this value is the overall polling deadline; the plugin polls every 2
+  seconds until `completed` or `failed`.
 - Set `CONTROL_MIN_INTERVAL` above the observed refresh duration so queued
   scan events do not immediately hit `429`.
 - A refresh that exceeds the plugin timeout still completes on the TMC side.
   The plugin's retry then sees `429` while the lock is held (`409` if the
   refresh is still running). Treat both as "refresh in progress", not as a
-  hard failure.
+  hard failure. The job remains readable at `GET /refresh/jobs/{id}` until it
+  falls out of the 20-job retention window.
 
 ## FUSE mount visibility and propagation
 
@@ -429,6 +539,105 @@ This is a known and accepted constraint of the `strm` mount method, not a bug:
 - `fuse` mode does not write API keys to disk files, at the cost of the FUSE
   requirements above.
 
+## Troubleshooting the control API and plugin
+
+### `401 unauthorized`
+
+- The plugin token and `CONTROL_TOKEN` differ. Re-enter the exact value in
+  **Dashboard -> Plugins -> TorBox Refresh** and in `.env`/the secret file.
+- TMC reads `CONTROL_TOKEN` once at process start. Restart the container after
+  changing it; editing `.env` alone does nothing.
+- A reverse proxy or ingress stripped the `Authorization` header. Configure it
+  to pass the header through unchanged.
+- The request used `TORBOX_API_KEY` by mistake. The control token is a separate
+  credential.
+- After rotation, expect `401` until both sides carry the new value. It is safe
+  to retry.
+
+### `409 refresh already running`
+
+A scheduled `MOUNT_REFRESH_TIME` refresh, a manual request, or an earlier scan
+still holds the single refresh lock. `force: true` does not bypass it. Async
+`409` responses include `job_id` and `active_job_id`; poll
+`GET /refresh/jobs/{id}` instead of retrying. The plugin treats `409` as
+"already handled" and does not queue a follow-up scan.
+
+### `429 cooldown`
+
+`CONTROL_MIN_INTERVAL` has not elapsed since the last refresh finished. The
+response contains `retry_after` and a `Retry-After` header. This is not an
+error in the plugin: it is a no-op, and the plugin does not queue a second
+scan. If `429`s are frequent, raise the plugin cooldown to at least
+`CONTROL_MIN_INTERVAL`, or raise `CONTROL_MIN_INTERVAL` above the refresh
+duration. `force: true` skips this check; the plugin does not send it.
+
+### Side-loaded plugin and repository warnings
+
+Jellyfin warns when a plugin is side-loaded, when a repository is not trusted,
+or when two plugins share a GUID. To avoid this:
+
+1. Remove any manually copied folder under `<jellyfin config>/plugins/TorBoxRefresh`.
+2. Add the manifest URL under **Dashboard -> Plugins -> Repositories** and
+   install **TorBox Refresh** from the catalog.
+3. Restart Jellyfin after adding or removing plugin files.
+4. Keep the plugin GUID `a7c2f0e4-6b1d-4f3a-9c8e-2d5b7a1e4f60` stable; a
+   manifest entry with a different GUID creates a duplicate.
+
+The catalog entry currently has no custom icon, so Jellyfin may show a
+placeholder image. That is expected and does not affect refreshes.
+
+### Two-scan sequence
+
+`ILibraryPostScanTask` runs after Jellyfin has already walked the library, so
+the files added by a refresh cannot be seen by the same scan. The expected flow
+is:
+
+1. First scan finishes walking the old mount.
+2. Post-scan task calls TMC and gets change counts.
+3. If `changed > 0` and `QueueFollowUpScan` is enabled, Jellyfin queues one
+   follow-up scan.
+4. Second scan walks the updated mount and picks up the new files.
+5. The second scan's post-scan task hits the plugin cooldown and stops, so no
+   scan loop occurs.
+
+An unchanged mount, a failed refresh, and a `409`/`429` all produce
+`changed = 0` and therefore no follow-up scan. Do not disable the follow-up
+scan unless another tool watches the mount.
+
+### Token storage
+
+TMC reads the token from `CONTROL_TOKEN` in the environment or the exported
+Docker secret. The plugin stores the same value in Jellyfin's plugin
+configuration XML (plain text) in the Jellyfin config directory. Protect that
+directory with filesystem permissions, keep it out of shared backups, and
+rotate the control token if it leaks. Rotating the TorBox API key does not
+rotate the control token, and vice versa.
+
+### Cooldown and timeouts
+
+- The effective gap between refreshes is
+  `max(plugin cooldown, CONTROL_MIN_INTERVAL)`. The plugin's default cooldown is
+  300 seconds; TMC's default is 60 seconds.
+- The plugin's **Request timeout** is a per-request timeout for the synchronous
+  endpoint and the overall deadline for async job polling. The plugin polls
+  every 2 seconds.
+- TMC keeps working after the plugin times out. A later retry sees `409` while
+  the lock is held or `429` during the cooldown; both mean "in progress", not
+  "failed".
+- For cross-host reverse proxies, set the read timeout at least as high as the
+  expected refresh duration.
+
+### Metadata-enabled slow refreshes
+
+With `ENABLE_METADATA=true`, TMC calls the TorBox metadata search endpoint per
+item and can take minutes; `429`s from TorBox are expected. This is usually much
+longer than a default plugin timeout. Either keep metadata disabled (fast,
+no rate limit) or raise the plugin timeout to 300-600 seconds and raise
+`CONTROL_MIN_INTERVAL` above the observed duration. A refresh that outlives the
+plugin timeout still finishes on TMC and can be inspected via
+`GET /refresh/jobs/{id}`. See
+[Metadata-enabled slow refresh and plugin timeout](#metadata-enabled-slow-refresh-and-plugin-timeout).
+
 ## Compatibility matrix
 
 Keep this table in sync with the plugin repository (`PLG-DOC-4`). Fill a row
@@ -436,17 +645,22 @@ for every TMC release that changes the control API or the `.strm` layout.
 
 | TMC version | Control API version | Jellyfin plugin | Jellyfin | Notes |
 |---|---|---|---|---|
-| 2.0.x | not reported yet | 0.1.x | 10.11.x | Baseline: bearer auth, `/health`, `/refresh`, `force`, `CONTROL_MIN_INTERVAL`. |
-| _next_ | _1_ | _x.y.z_ | _10.11.x_ | _Update when `TMC-API-1` lands and `/health` reports the API version._ |
+| 2.0.x | not reported | 0.1.x | 10.11.x | Legacy baseline: bearer auth, `/health`, synchronous `/refresh`, `force`, `CONTROL_MIN_INTERVAL`. |
+| next 2.x (`feat/jellyfin-refresh-control-api`) | **2** | **1.1.0** | **12.4.0** | `/health` reports `api_version: 2`; async `POST /refresh/jobs` + polling, `Idempotency-Key`, 20-job retention. Synchronous `/refresh` stays for plugin 1.0.0. |
+| _pending_ | _2_ | _1.1.x_ | _13.x_ | **Not available.** Jellyfin 13.x `Jellyfin.Controller` / `Jellyfin.Model` NuGet packages are unpublished, so there is no 13.x plugin artifact yet. |
 
 Rules:
 
-- "Control API version" is the value reported by `/health` once
-  `TMC-API-1` is implemented. Until then, use the TMC version.
+- "Control API version" is the `api_version` value reported by `GET /health`.
+  A server that does not report it is treated as legacy by plugin 1.1.0.
+- Plugin 1.1.0 requires control API v2 for async jobs. It still works against a
+  legacy TMC by falling back to synchronous `POST /refresh` when `/health`
+  returns `404` or an unreadable payload.
 - A plugin must be listed in a row before it is supported against that TMC
   version.
-- Jellyfin 10.11.x is the tested baseline; older versions may work but are not
-  supported for the scan-trigger flow.
+- Jellyfin **12.4.0** (`targetAbi` `12.4.0.0`) is the tested baseline. Jellyfin
+  13.x is pending until the NuGet packages are published; do not claim 13.x
+  support.
 - Pin both the TMC image tag and the plugin version in production.
 
 ## Release, upgrade and rollback
@@ -462,14 +676,17 @@ Release notes for TMC:
 
 Upgrade order (the API is additive, so TMC first):
 
-1. Back up `.env` and note the current TMC image tag/digest.
-2. Pull and start the new TMC image. Verify `GET /health` returns 200 and the
-   fields you rely on are still present.
-3. Trigger one manual refresh and confirm the `.strm` counts look normal.
-4. Upgrade the Jellyfin plugin, restart Jellyfin if required, and save the
-   plugin configuration.
-5. Run a library scan and confirm the plugin receives 200 (or an expected
-   429/409), not 401/404.
+1. Back up `.env` and the Jellyfin plugin config XML; note the current TMC
+   image tag/digest and plugin version.
+2. Pull and start the new TMC image. Verify `GET /health` returns 200 with
+   `api_version: 2` and the other fields you rely on.
+3. Trigger one manual refresh. On v2 expect `POST /refresh/jobs` to return 202
+   and the job to reach `completed`; `POST /refresh` still returns 200.
+   Confirm the `.strm` counts look normal.
+4. Upgrade the Jellyfin plugin (1.1.0 for async jobs), restart Jellyfin if
+   required, and save the plugin configuration.
+5. Run a library scan and confirm the plugin receives `202` and polls to
+   `completed`, or an expected `409`/`429` no-op, not `401`/`404`.
 
 Rollback:
 
