@@ -63,6 +63,24 @@ The `fuse` option is meant to be a fallback for everything else, Plex, VLC, Infu
 >
 > Plex / VLC / Anything else => `fuse`
 
+### 🧩 Compatibility with the Jellyfin plugin
+
+The scan-triggered refresh feature needs a TMC version and a plugin version that
+both speak the control API. The authoritative matrix lives in
+[docker.md](docker.md#compatibility-matrix); keep it updated when either side is
+released.
+
+| TMC version | Control API version | Jellyfin plugin | Jellyfin |
+|---|---|---|---|
+| 2.0.x | not reported yet | 0.1.x | 10.11.x |
+| _next_ | _1_ | _x.y.z_ | _10.11.x_ |
+
+The plugin is optional. Without it, TMC keeps refreshing on
+`MOUNT_REFRESH_TIME` as before. See
+[Compatibility matrix](docker.md#compatibility-matrix) for the full template and
+[Release, upgrade and rollback](docker.md#release-upgrade-and-rollback) before
+upgrading a production pair.
+
 ## 🔌 Choosing a mounting method
 
 [Above](https://github.com/TorBox-App/torbox-media-center/tree/main?tab=readme-ov-file#compatibility) we explained compatibility, which should be the main driving factor for making a decision, but there are few other things we should mention.
@@ -98,13 +116,51 @@ To run this project you will need to add the following environment variables to 
 
 `CONTROL_ENABLED` Starts the local control API used by the Jellyfin plugin. Default is `false` and is optional.
 
-`CONTROL_HOST`, `CONTROL_PORT`, `CONTROL_TOKEN` Control API bind address, port and bearer token. `CONTROL_TOKEN` is required when the control API is enabled. In Docker use `CONTROL_HOST=0.0.0.0` and keep the port on a private network; do not publish it to the host.
+`CONTROL_HOST`, `CONTROL_PORT`, `CONTROL_TOKEN` Control API bind address, port and bearer token. `CONTROL_TOKEN` is required when the control API is enabled. In Docker use `CONTROL_HOST=0.0.0.0` and keep the port on a private network; do not publish it to the host. Generate the token with `openssl rand -hex 32` (or `python3 -c "import secrets; print(secrets.token_urlsafe(32))"`), and **do not reuse `TORBOX_API_KEY` as the control token**. See [token generation and rotation](docker.md#generating-and-rotating-the-control-token).
 
-`CONTROL_MIN_INTERVAL` Minimum seconds between control-triggered refreshes. Default is `60` and is optional.
+`CONTROL_MIN_INTERVAL` Minimum seconds between control-triggered refreshes. Default is `60` and is optional. It is enforced by TMC independently of the plugin's own cooldown; see [refresh timing](docker.md#refresh-timing-control_min_interval-and-the-plugin-cooldown).
 
 ### 🧩 Jellyfin plugin
 
 The optional [Jellyfin plugin](https://github.com/DanCorley/jellyfin-plugin-torbox-refresh) calls the control API after a library scan and queues a follow-up scan when the mount changed. Configure its URL, token and cooldown in **Dashboard -> Plugins -> TorBox Refresh**.
+
+### 🔐 Control API security (read before enabling)
+
+The control API can trigger library refreshes, so treat it as an internal
+service:
+
+- **Private network only.** Never publish port `8787` to the host or the
+  internet. In compose use `expose`, not `ports`. If a reverse proxy runs on
+  the same host, bind to loopback only (`127.0.0.1:8787:8787`).
+- **Use a dedicated random token.** Generate a separate secret with
+  `openssl rand -hex 32`; never reuse the TorBox API key and never commit the
+  token or put it in an image.
+- **TLS for cross-host use.** TMC speaks plain HTTP. Put WireGuard/Tailscale or
+  a TLS-terminating reverse proxy in front of it before any traffic leaves the
+  Docker host.
+- **Keep secrets out of Git.** `.env` is git-ignored and excluded from the
+  image. Use `chmod 600`, or Docker secrets exported by an entrypoint wrapper.
+- **Use non-root for `strm`.** Add `user: "1000:1000"` and make the output
+  directory writable by that UID/GID. FUSE still needs `/dev/fuse` and
+  `SYS_ADMIN` and normally runs as root.
+- **`.strm` files contain your TorBox credential.** Download URLs written into
+  `.strm` files embed the API key. This is an accepted design constraint of
+  `strm` mode: restrict library permissions, never share the files, and revoke
+  the key in TorBox if it leaks.
+- **Watch refresh health.** `/health` reports `last_finished`, `last_result`
+  and `last_error`; alert on `last_error` and slow `duration_ms`, not only on
+  container health. Logs are rotated by compose.
+
+```
+Jellyfin plugin --HTTP + Bearer--> TMC control API :8787 (private network)
+        |                                   |
+        +-- reads .strm (shared volume)     +-- HTTPS --> TorBox API
+```
+
+Full deployment guidance: [Control API: deployment, security and
+operations](docker.md#control-api-deployment-security-and-operations), including
+[FUSE propagation](docker.md#fuse-mount-visibility-and-propagation) and
+[slow metadata refreshes](docker.md#metadata-enabled-slow-refresh-and-plugin-timeout).
 
 ## 🐳 Running on Docker with one command (recommended)
 
@@ -172,6 +228,17 @@ services:
 ```
 
 *You may also use the Github repository container found here: ghcr.io/torbox-app/torbox-media-center:main*
+
+> [!NOTE]
+> The `docker-compose.yaml` in this repository is a **personal combined
+> deployment** (TMC + Jellyfin + local paths). An upstream PR should ship a
+> generic TMC-only compose file and keep personal services in a local override,
+> for example `docker compose -f docker-compose.yaml -f docker-compose.personal.yaml up -d`.
+> Never add `ports:` for the control API port `8787`; use `expose` only.
+>
+> When using FUSE, mount the shared library with `rshared` propagation in both
+> containers and run `mount --make-rshared /mnt/torbox` on the host. See
+> [FUSE mount visibility and propagation](docker.md#fuse-mount-visibility-and-propagation).
 
 3. Wait for the files to be mounted to your local system.
 
@@ -243,6 +310,30 @@ Then inside your Plex/Jellyfin/Emby container, set the library location to /torb
 ### I cannot modify the files inside of the Fuse path! ###
 
 The Fuse mount is not meant to be editable, it is read-only. You cannot rename files, delete files, or move them around. This is by design as this software handles that. To delete a file, simply delete it from your TorBox account.
+
+## 🚀 Releases, upgrades and rollback
+
+TMC images are built by
+`.github/workflows/docker-build.yml` and published to the GHCR namespace of the
+repository that runs the workflow (`ghcr.io/<owner>/<repo>`). A fork publishes
+to its own namespace; nothing is pushed to the upstream project or a personal
+Docker Hub account unless you explicitly enable it.
+
+- Pin production to a released semver tag or an image digest. `main` and branch
+  tags are for testing.
+- Upgrade order: **TMC first, then the Jellyfin plugin.** The control API is
+  additive, so an older plugin keeps working against a newer TMC, but a newer
+  plugin may require endpoints an older TMC does not have.
+- Verify after each step: `GET /health` returns 200 with the expected fields,
+  then a manual refresh returns 200 with sane counts (not 401/404).
+- Rollback: pin the previous TMC tag/digest, recreate the container, and roll
+  the plugin back to the version listed for that TMC release in the
+  [compatibility matrix](docker.md#compatibility-matrix). TMC rebuilds its local
+  cache from the TorBox API on startup; the `.strm` tree and `.env`/secret file
+  are the durable state to keep.
+
+See [Release, upgrade and rollback](docker.md#release-upgrade-and-rollback) for
+the step-by-step checklist and expected 429/409 responses.
 
 ## 🆘 Support
 

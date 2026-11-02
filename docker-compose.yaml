@@ -1,3 +1,15 @@
+# Personal combined deployment (TorBox Media Center + Jellyfin).
+#
+# An upstream PR should NOT ship this file as-is. Use a generic TMC-only compose
+# file for upstream (just the torbox-media-center service, no Jellyfin, no
+# personal paths) and keep the Jellyfin service and host-specific values here in
+# a local override, e.g.:
+#
+#   docker compose -f docker-compose.yaml -f docker-compose.personal.yaml up -d
+#
+# The control API is reachable by Jellyfin over the private compose network via
+# the service name `torbox-media-center:8787`. Port 8787 is intentionally NOT
+# published to the host; do not add a `ports:` entry for it.
 name: torbox-media-center
 services:
     torbox-media-center:
@@ -5,12 +17,15 @@ services:
             context: .
             dockerfile: dockerfile
         container_name: torbox-media-center
+        init: true
         stdin_open: true
         tty: true
         restart: always
         volumes:
             - ./torbox:/torbox
         env_file:
+            # Keep this file out of Git and chmod 600 on the host. See
+            # docker.md for Docker secrets / restricted env-file guidance.
             - .env
         environment:
             # - TORBOX_API_KEY=<input your api key>
@@ -24,9 +39,45 @@ services:
             - CONTROL_PORT=${CONTROL_PORT:-8787}
             - CONTROL_TOKEN=${CONTROL_TOKEN:-}
             - CONTROL_MIN_INTERVAL=${CONTROL_MIN_INTERVAL:-60}
+        # `expose` only documents the port on the private compose network; it
+        # does not publish it to the host. Never use `ports:` for 8787.
         expose:
             - "8787"
-        # image: anonymoussystems/torbox-media-center:main
+        healthcheck:
+            test:
+                - CMD-SHELL
+                - >-
+                    python -c "import os,sys,urllib.request;
+                    enabled=os.getenv('CONTROL_ENABLED','false').lower()=='true';
+                    sys.exit(0) if not enabled else
+                    urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:'+os.getenv('CONTROL_PORT','8787')+'/health',
+                    headers={'Authorization':'Bearer '+os.getenv('CONTROL_TOKEN','')}),
+                    timeout=5).read()"
+            interval: 30s
+            timeout: 10s
+            start_period: 180s
+            retries: 3
+        logging:
+            driver: json-file
+            options:
+                max-size: 10mb
+                max-file: 5
+        # Non-root STRM mode (optional). The host ./torbox directory must be
+        # writable by this UID/GID. Do NOT use this with MOUNT_METHOD=fuse:
+        # FUSE still needs /dev/fuse plus SYS_ADMIN and normally runs as root.
+        # user: "1000:1000"
+        # Optional hardening for strm mode only:
+        # security_opt:
+        #     - no-new-privileges:true
+        # Optional Docker secrets instead of a plain .env file (the app reads
+        # env vars, so export the secret in the entrypoint). Compose escapes
+        # `$$` to a literal `$`.
+        # secrets:
+        #     - control_token
+        # entrypoint:
+        #     - /bin/sh
+        #     - -c
+        #     - export CONTROL_TOKEN=$$(cat /run/secrets/control_token); exec python main.py
 
     jellyfin:
         image: linuxserver/jellyfin:latest # 10.11.11 for backup
@@ -52,3 +103,9 @@ services:
             options:
                 max-size: 10mb
                 max-file: 5
+
+# Optional Docker secrets backing the commented `secrets:` block above. Files
+# live outside Git (e.g. ./secrets/, git-ignored, chmod 600).
+# secrets:
+#     control_token:
+#         file: ./secrets/control_token.txt
