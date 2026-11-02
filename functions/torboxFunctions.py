@@ -9,7 +9,6 @@ import os
 import logging
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import multiprocessing
 
 class DownloadType(Enum):
     torrent = "torrents"
