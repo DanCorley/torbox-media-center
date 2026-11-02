@@ -3,6 +3,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from functions.appFunctions import bootUp, getMountMethod, getAllUserDownloadsFresh, getMountRefreshTime
 from functions.databaseFunctions import closeAllDatabases
 import logging
+import os
 from sys import platform
 
 logging.basicConfig(
@@ -35,6 +36,14 @@ if __name__ == "__main__":
         hours=getMountRefreshTime(),
         id="get_all_user_downloads_fresh",
     )
+
+    if os.getenv("CONTROL_ENABLED", "false").lower() == "true":
+        from functions.controlServer import startControlServer
+        try:
+            startControlServer()
+        except Exception as e:
+            logging.error("Failed to start control API: %s", e)
+            exit(1)
 
     try:
         logging.info("Starting scheduler and mounting...")

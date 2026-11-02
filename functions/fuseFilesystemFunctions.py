@@ -7,7 +7,7 @@ from functions.torboxFunctions import getDownloadLink, downloadFile
 import time
 import sys
 import logging
-from functions.appFunctions import getAllUserDownloads
+from functions.appFunctions import getAllUserDownloadsWithStatus
 import threading
 from sys import platform
 
@@ -24,6 +24,14 @@ if not hasattr(fuse, '__version__'):
 fuse.fuse_python_api = (0, 2)
 
 LINK_AGE = 3 * 60 * 60 # 3 hours
+
+_fuse_server = None
+
+def requestFuseRefresh(wait=True, timeout=30):
+    """Ask the running FUSE server to rebuild its VFS from the database."""
+    if _fuse_server is None:
+        return False
+    return _fuse_server.triggerRefresh(wait=wait, timeout=timeout)
 
 class VirtualFileSystem:
     def __init__(self, files_list):
@@ -136,8 +144,8 @@ class TorBoxMediaCenterFuse(Fuse):
     def __init__(self, *args, **kwargs):
         super(TorBoxMediaCenterFuse, self).__init__(*args, **kwargs)
 
-        threading.Thread(target=self.getFiles, daemon=True).start()
-
+        # Initialize state before the refresh thread starts; otherwise the
+        # first successful fetch can be overwritten by these initializers.
         self.files = []
         self.vfs = VirtualFileSystem(self.files)
         self.file_handles = {}
@@ -148,14 +156,38 @@ class TorBoxMediaCenterFuse(Fuse):
         self.block_size = 1024 * 1024 * 64  # 64MB Blocks
         self.max_blocks = 64 # Max 64 blocks in cache (4GB)
 
+        self._refresh_event = threading.Event()
+        self._refresh_done = threading.Event()
+        self._stop_event = threading.Event()
+
+        threading.Thread(target=self.getFiles, daemon=True).start()
+
     def getFiles(self):
-        while True:
-            files = getAllUserDownloads()
-            if files:
+        while not self._stop_event.is_set():
+            files, errors = getAllUserDownloadsWithStatus()
+            if errors:
+                logging.error("Skipping VFS refresh because a database read failed: %s", errors)
+            else:
                 self.files = files
-                self.vfs = VirtualFileSystem(self.files)
+                self.vfs = VirtualFileSystem(files)
                 logging.debug(f"Updated {len(self.files)} files in VFS")
-            time.sleep(300)
+
+            self._refresh_done.set()
+            self._refresh_event.wait(300)
+            self._refresh_event.clear()
+
+        self._refresh_done.set()
+
+    def triggerRefresh(self, wait=True, timeout=30):
+        self._refresh_done.clear()
+        self._refresh_event.set()
+        if not wait:
+            return True
+        return self._refresh_done.wait(timeout)
+
+    def stop(self):
+        self._stop_event.set()
+        self._refresh_event.set()
         
     def getattr(self, path):
         st = FuseStat()
@@ -261,11 +293,13 @@ class TorBoxMediaCenterFuse(Fuse):
         return 0
     
 def runFuse():
+    global _fuse_server
     server = TorBoxMediaCenterFuse(
         version="%prog " + fuse.__version__,
         usage="%prog [options] mountpoint",
         dash_s_do="setsingle",
     )
+    _fuse_server = server
 
     server.parser.add_option(
         mountopt="root",
@@ -289,7 +323,11 @@ def runFuse():
     except OSError as e:
         logging.error(f"Error changing directory: {e}")
         sys.exit(1)
-    server.main()
+    try:
+        server.main()
+    finally:
+        server.stop()
+        _fuse_server = None
 
 def unmountFuse():
     try:

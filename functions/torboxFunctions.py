@@ -5,7 +5,6 @@ import PTN
 from library.torbox import TORBOX_API_KEY
 from library.app import SCAN_METADATA
 from functions.mediaFunctions import constructSeriesTitle, cleanTitle, cleanYear
-from functions.databaseFunctions import insertData
 import os
 import logging
 import traceback
@@ -57,7 +56,6 @@ def process_file(item, file, type):
     metadata, _, _ = searchMetadata(title_data.get("title", file.get("short_name")), title_data, file.get("short_name"), f"{item.get('name')} {file.get('short_name')}", item.get("hash"), item.get("name"))
     data.update(metadata)
     logging.debug(data)
-    insertData(data, type.value)
     return data
 
 def getUserDownloads(type: DownloadType):
@@ -100,7 +98,8 @@ def getUserDownloads(type: DownloadType):
     files = []
     
     # Get the number of CPU cores for parallel processing
-    max_workers = int(multiprocessing.cpu_count() * 2 - 1)
+    # max_workers = int(multiprocessing.cpu_count() * 2 - 1)
+    max_workers = 7
     logging.info(f"Processing files with {max_workers} parallel threads")
     
     # Collect all files to process

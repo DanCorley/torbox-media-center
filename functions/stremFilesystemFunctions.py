@@ -1,117 +1,159 @@
 import os
 import glob
 import logging
+import threading
 from library.app import RAW_MODE
 from library.filesystem import MOUNT_PATH
-from functions.appFunctions import getAllUserDownloads
+from functions.appFunctions import getAllUserDownloadsWithStatus, refresh_lock
+
+MEDIA_DIRS = {"movie": "movies", "series": "series", "anime": "series"}
+
 
 def generateFolderPath(data: dict) -> str | None:
     """
     Takes in a user download and returns the folder path for the download.
     """
-    
     if RAW_MODE:
         original_path = data.get("path")
-        if original_path:
-            return os.path.dirname(original_path)
+        return os.path.dirname(original_path) if original_path else None
+
+    root_folder: str | None = data.get("metadata_rootfoldername", None)
+    metadata_foldername: str | None = data.get("metadata_foldername", None)
+    mediatype = data.get("metadata_mediatype")
+
+    if not root_folder:
         return None
-    else:
-      root_folder: str | None = data.get("metadata_rootfoldername", None)
-      metadata_foldername: str | None = data.get("metadata_foldername", None)
 
-      if not root_folder:
-          return None
+    if mediatype in ("series", "anime"):
+        if not metadata_foldername:
+            return None
+        return os.path.join(root_folder, metadata_foldername)
 
-      if data.get("metadata_mediatype") == "series":
-          if not metadata_foldername:
-              return None
-          folder_path = os.path.join(
-              root_folder,
-              metadata_foldername,
-          )
-      elif data.get("metadata_mediatype") == "movie":
-          folder_path = os.path.join(
-              root_folder
-          )
+    if mediatype == "movie":
+        return root_folder
 
-      elif data.get("metadata_mediatype") == "anime":
-          if not metadata_foldername:
-              return None
-          folder_path = os.path.join(
-              root_folder,
-              metadata_foldername,
-          )
-          
-      return folder_path
+    logging.debug(f"Unknown media type {mediatype!r} for {data.get('file_name')!r}")
+    return None
 
-def generateStremFile(file_path: str, url: str, type: str, file_name: str, download=None):
+
+def generateStremFile(file_path: str, url: str, type: str, file_name: str, download=None) -> str:
+    """
+    Write a .strm file only when its contents changed.
+    Returns "added", "updated", "unchanged", or "error".
+    """
     if RAW_MODE:
-        original_path = download.get("path")
-        if original_path:
-            full_path = os.path.join(MOUNT_PATH, os.path.dirname(original_path))
+        original_path = download.get("path") if download else None
+        if not original_path:
+            return "error"
+        full_path = os.path.join(MOUNT_PATH, os.path.dirname(original_path))
     else:
-        if type == "movie":
-            type = "movies"
-        elif type == "series":
-            type = "series"
-        elif type == "anime":
-            type = "series"
-        full_path = os.path.join(MOUNT_PATH, type, file_path)
+        media_dir = MEDIA_DIRS.get(type)
+        if media_dir is None:
+            logging.error(f"Unknown media type {type!r} for {file_name}")
+            return "error"
+        full_path = os.path.join(MOUNT_PATH, media_dir, file_path)
+
+    strm_file_path = os.path.join(full_path, f"{file_name}.strm")
+    tmp_path = f"{strm_file_path}.tmp.{os.getpid()}.{threading.get_ident()}"
+
     try:
         os.makedirs(full_path, exist_ok=True)
-        with open(f"{full_path}/{file_name}.strm", "w") as file:
+
+        existing = None
+        if os.path.exists(strm_file_path):
+            try:
+                with open(strm_file_path, "r", encoding="utf-8") as file:
+                    existing = file.read()
+            except OSError:
+                existing = None  # overwrite an unreadable file
+
+        if existing == url:
+            return "unchanged"
+
+        with open(tmp_path, "w", encoding="utf-8") as file:
             file.write(url)
-        logging.debug(f"Created strm file: {full_path}/{file_name}.strm")
-        return True
+        os.replace(tmp_path, strm_file_path)
+        logging.debug(f"Created strm file: {strm_file_path}")
+        return "updated" if existing is not None else "added"
     except FileNotFoundError as e:
         logging.error(f"Error creating strm file (likely bad naming scheme of file): {e}")
-        return False
     except OSError as e:
         logging.error(f"Error creating strm file (likely bad or missing permissions): {e}")
-        return False
     except Exception as e:
         logging.error(f"Error creating strm file: {e}")
-        return False
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+
+    return "error"
+
 
 def runStrm():
-    all_downloads = getAllUserDownloads()
+    with refresh_lock:
+        return _runStrm()
+
+
+def _runStrm():
+    all_downloads, errors = getAllUserDownloadsWithStatus()
     # Get all existing .strm files
     existing_strm_files = set(glob.glob(os.path.join(MOUNT_PATH, "**", "*.strm"), recursive=True))
 
+    counts = {"added": 0, "updated": 0, "unchanged": 0, "removed": 0, "error": 0}
     new_strm_files = set()
+
     for download in all_downloads:
         file_path = generateFolderPath(download)
         if file_path is None:
             continue
-        if RAW_MODE:
-            strm_path = os.path.join(MOUNT_PATH, file_path, f"{download.get('metadata_filename')}.strm")
-        else:
-            type = download.get("metadata_mediatype")
-            if type == "movie":
-                type = "movies"
-            elif type == "series":
-                type = "series"
-            elif type == "anime":
-                type = "series"
-            strm_path = os.path.join(MOUNT_PATH, type, file_path, f"{download.get('metadata_filename')}.strm")
-        new_strm_files.add(strm_path)
-        generateStremFile(file_path, download.get("download_link"), download.get("metadata_mediatype"), download.get("metadata_filename"), download)
 
-    # Remove .strm files for deleted downloads
-    for strm_file in existing_strm_files:
-        if strm_file not in new_strm_files:
+        mediatype = download.get("metadata_mediatype")
+        file_name = download.get("metadata_filename")
+        if not file_name:
+            continue
+
+        if RAW_MODE:
+            strm_path = os.path.join(MOUNT_PATH, file_path, f"{file_name}.strm")
+        else:
+            media_dir = MEDIA_DIRS.get(mediatype)
+            if media_dir is None:
+                continue
+            strm_path = os.path.join(MOUNT_PATH, media_dir, file_path, f"{file_name}.strm")
+
+        new_strm_files.add(strm_path)
+        status = generateStremFile(
+            file_path,
+            download.get("download_link"),
+            mediatype,
+            file_name,
+            download,
+        )
+        counts[status] = counts.get(status, 0) + 1
+
+    # A failed type would look like a removed download, so never delete
+    # stale files while the database read is incomplete.
+    if errors:
+        logging.error("Skipping stale .strm cleanup because a database read failed: %s", errors)
+    else:
+        for strm_file in existing_strm_files - new_strm_files:
             try:
                 os.remove(strm_file)
-                logging.debug(f"Removed stale .strm file: {strm_file}")
+                counts["removed"] += 1
                 # Remove empty directories
-                dir = os.path.dirname(strm_file)
-                while dir != MOUNT_PATH and not os.listdir(dir):
-                    os.rmdir(dir)
-                    dir = os.path.dirname(dir)
+                directory = os.path.dirname(strm_file)
+                while directory != MOUNT_PATH and not os.listdir(directory):
+                    os.rmdir(directory)
+                    directory = os.path.dirname(directory)
             except Exception as e:
                 logging.error(f"Error removing .strm file: {e}")
+                counts["error"] += 1
 
-    logging.debug(f"Updated {len(all_downloads)} strm files.")
+    counts["changed"] = counts["added"] + counts["updated"] + counts["removed"]
+    logging.debug("STRM reconcile: %s", counts)
+    return counts
+
 
 def unmountStrm():
     """

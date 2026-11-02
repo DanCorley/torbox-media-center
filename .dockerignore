@@ -1,6 +1,15 @@
+.git
 .github
+.env
 .env.example
 .gitignore
 CHANGELOG.md
 *.md
 *.yaml
+config
+torbox
+tests
+__pycache__
+.ruff_cache
+jellyfin-plugin/**/bin
+jellyfin-plugin/**/obj

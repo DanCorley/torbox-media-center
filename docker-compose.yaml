@@ -1,18 +1,54 @@
 name: torbox-media-center
 services:
     torbox-media-center:
+        build:
+            context: .
+            dockerfile: dockerfile
         container_name: torbox-media-center
         stdin_open: true
         tty: true
         restart: always
         volumes:
-            - /home/$(whoami)/torbox:/torbox
+            - ./torbox:/torbox
+        env_file:
+            - .env
         environment:
-            - TORBOX_API_KEY=<input your api key>
+            # - TORBOX_API_KEY=<input your api key>
             - MOUNT_METHOD=strm
             - MOUNT_PATH=/torbox
             - RAW_MODE=false
             - ENABLE_METADATA=false
             - MOUNT_REFRESH_TIME=slow
-        image: anonymoussystems/torbox-media-center:main
-     
+            - CONTROL_ENABLED=${CONTROL_ENABLED:-false}
+            - CONTROL_HOST=${CONTROL_HOST:-0.0.0.0}
+            - CONTROL_PORT=${CONTROL_PORT:-8787}
+            - CONTROL_TOKEN=${CONTROL_TOKEN:-}
+            - CONTROL_MIN_INTERVAL=${CONTROL_MIN_INTERVAL:-60}
+        expose:
+            - "8787"
+        # image: anonymoussystems/torbox-media-center:main
+
+    jellyfin:
+        image: linuxserver/jellyfin:latest # 10.11.11 for backup
+        container_name: jellyfin
+        environment:
+            - PUID=1000
+            - PGID=1000
+            - TZ=America/Chicago
+            # - JELLYFIN_PublishedServerUrl=jellyfin.watermancorley.com #optional
+        volumes:
+            - ./config:/config
+            - ./torbox:/torbox
+        env_file:
+            - .env
+        ports:
+            - 8096:8096
+            # - 8920:8920 #optional
+            - 7359:7359/udp #optional
+            - 1900:1900/udp #optional
+        restart: unless-stopped
+        logging:
+            driver: json-file
+            options:
+                max-size: 10mb
+                max-file: 5

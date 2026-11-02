@@ -96,6 +96,16 @@ To run this project you will need to add the following environment variables to 
 
 `RAW_MODE` This option determines whether you want the raw file structure (similar to what you would see with webdav). Setting this to `true` will present the files in the original structure. If this is enabled, the `ENABLE_METADATA` option is disabled.
 
+`CONTROL_ENABLED` Starts the local control API used by the Jellyfin plugin. Default is `false` and is optional.
+
+`CONTROL_HOST`, `CONTROL_PORT`, `CONTROL_TOKEN` Control API bind address, port and bearer token. `CONTROL_TOKEN` is required when the control API is enabled. In Docker use `CONTROL_HOST=0.0.0.0` and keep the port on a private network; do not publish it to the host.
+
+`CONTROL_MIN_INTERVAL` Minimum seconds between control-triggered refreshes. Default is `60` and is optional.
+
+### 🧩 Jellyfin plugin
+
+The optional [Jellyfin plugin](https://github.com/DanCorley/jellyfin-plugin-torbox-refresh) calls the control API after a library scan and queues a follow-up scan when the mount changed. Configure its URL, token and cooldown in **Dashboard -> Plugins -> TorBox Refresh**.
+
 ## 🐳 Running on Docker with one command (recommended)
 
 We provide bash scripts for running the TorBox Media Center easily by simply copying the script to your server or computer, and running it, following the prompts. This can be helpful if you aren't familiar with Docker, permissions or servers in general. Simply choose one in [this folder](https://github.com/TorBox-App/torbox-media-center/blob/main/scripts) that pertains to your system and run it in the terminal.

@@ -50,6 +50,39 @@ def clearDatabase(type: str):
         except Exception as e:
             return False, f"Error clearing the database: {e}"
     
+def replaceData(data_list: list, type: str):
+    """
+    Replaces the entire database contents with data_list under one lock.
+    Readers never observe a half-replaced database.
+    """
+    db = getDatabase(type)
+    db_lock = getDatabaseLock(type)
+
+    if db is None or db_lock is None:
+        return False, "Database connection failed."
+
+    with db_lock:
+        try:
+            old_data = db.all()
+        except Exception as e:
+            return False, f"Error reading data before replace: {e}"
+
+        try:
+            db.truncate()
+            if data_list:
+                db.insert_multiple(data_list)
+            return True, "Data replaced successfully."
+        except Exception as e:
+            # Never leave the mount's source DB empty after a failed swap.
+            try:
+                db.truncate()
+                if old_data:
+                    db.insert_multiple(old_data)
+            except Exception:
+                logging.exception("Failed to restore %s after a failed replace", type)
+            return False, f"Error replacing data: {e}"
+
+
 def insertData(data: dict, type: str):
     """
     Inserts data into the database with thread safety.

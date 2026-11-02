@@ -2,13 +2,17 @@ from library.app import RAW_MODE
 from functions.torboxFunctions import getUserDownloads, DownloadType
 from library.filesystem import MOUNT_METHOD, MOUNT_PATH
 from library.app import MOUNT_REFRESH_TIME
-from library.torbox import TORBOX_API_KEY
-from functions.databaseFunctions import getAllData, clearDatabase
+from functions.databaseFunctions import getAllData, replaceData
 import logging
 import os
 import shutil
+import threading
 from library.app import getCurrentVersion
 import git
+
+# Serializes an API refresh with a mount rebuild. Re-entrant so a caller can
+# hold it across getAllUserDownloadsFresh() and runStrm().
+refresh_lock = threading.RLock()
 
 def initializeFolders():
     folders = [MOUNT_PATH]
@@ -31,43 +35,62 @@ def initializeFolders():
             os.makedirs(folder, exist_ok=True)
 
 def getAllUserDownloadsFresh():
+    """
+    Fetch every type first, then replace that type's database.
+    A type whose fetch fails keeps its previous rows; nothing is cleared
+    before the API call succeeds.
+    """
     all_downloads = []
-    logging.info("Fetching all user downloads...")
-    for download_type in DownloadType:
-        logging.debug(f"Clearing database for {download_type.value}...")
-        success, detail = clearDatabase(download_type.value)
-        if not success:
-            logging.error(f"Error clearing {download_type.value} database: {detail}")
-            continue
-        logging.debug(f"Fetching {download_type.value} downloads...")
-        downloads, success, detail = getUserDownloads(download_type)
-        if not success:
-            logging.error(f"Error fetching {download_type.value}: {detail}")
-            continue
-        if not downloads:
-            logging.info(f"No {download_type.value} downloads found.")
-            continue
-        all_downloads.extend(downloads)
-        logging.debug(f"Fetched {len(downloads)} {download_type.value} downloads.")
-    return all_downloads
+    errors = {}
 
-def getAllUserDownloads():
+    with refresh_lock:
+        logging.info("Fetching all user downloads...")
+        for download_type in DownloadType:
+            logging.debug(f"Fetching {download_type.value} downloads...")
+            downloads, success, detail = getUserDownloads(download_type)
+            if not success:
+                logging.error(f"Error fetching {download_type.value}: {detail}")
+                errors[download_type.value] = detail
+                continue
+
+            success, detail = replaceData(downloads or [], download_type.value)
+            if not success:
+                logging.error(f"Error storing {download_type.value}: {detail}")
+                errors[download_type.value] = detail
+                continue
+
+            all_downloads.extend(downloads or [])
+            logging.debug(f"Fetched {len(downloads or [])} {download_type.value} downloads.")
+
+    return {"downloads": all_downloads, "errors": errors}
+
+def getAllUserDownloadsWithStatus():
+    """
+    Read all download types from the local database.
+    Returns (records, errors) so callers can distinguish an empty library
+    from a database read failure.
+    """
     all_downloads = []
+    errors = {}
     for download_type in DownloadType:
         logging.debug(f"Fetching {download_type.value} downloads...")
         downloads, success, detail = getAllData(download_type.value)
         if not success:
             logging.error(f"Error fetching {download_type.value}: {detail}")
+            errors[download_type.value] = detail
             continue
         all_downloads.extend(downloads)
         logging.debug(f"Fetched {len(downloads)} {download_type.value} downloads.")
-    return all_downloads
+    return all_downloads, errors
+
+def getAllUserDownloads():
+    downloads, _ = getAllUserDownloadsWithStatus()
+    return downloads
 
 def bootUp():
     logging.debug("Booting up...")
     logging.info("Mount method: %s", MOUNT_METHOD)
     logging.info("Mount path: %s", MOUNT_PATH)
-    logging.info("TorBox API Key: %s", TORBOX_API_KEY)
     logging.info("Mount refresh time: %s %s", MOUNT_REFRESH_TIME, "hours")
 
     # check version
