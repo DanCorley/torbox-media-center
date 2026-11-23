@@ -61,7 +61,16 @@ def generateStremFile(file_path: str, url: str, type: str, file_name: str, downl
     try:
         os.makedirs(full_path, exist_ok=True)
         strm_file_path = f"{full_path}/{file_name}.strm"
-        with open(strm_file_path, "w") as file:
+        # Skip the write when the content would not change. Rewriting every
+        # .strm file on each scheduled run generates filesystem events, which
+        # makes Jellyfin rescan the entire library every 5 minutes.
+        try:
+            with open(strm_file_path, "r", encoding="utf-8") as existing:
+                if existing.read() == url:
+                    return True
+        except (FileNotFoundError, OSError):
+            pass
+        with open(strm_file_path, "w", encoding="utf-8") as file:
             file.write(url)
         if download:
             created_at = download.get("created_at")
